@@ -3,14 +3,14 @@
 # Reads 6 published CSV tabs from your Google Sheet:
 #   Lecture (master), Lectures_Ethics, Lectures_HCML, Quizzes, TimeLog, Files_Index
 # KPIs: remaining lectures, study coverage, knowledge progress, avg score, performance,
-# effort to reach grade 1, probability of grade 1, and LIVE Predicted Exam Score.
+# effort to reach grade 1, probability of grade 1, and LIVE Predicted Exam Score (+ German grade).
 # Charts: score trend, distribution, weekly minutes, per‑course timelines. Includes a What‑If planner.
 
 from __future__ import annotations
 
 import math
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -32,9 +32,10 @@ SHEET_LINKS = {
     "TimeLog":        "https://docs.google.com/spreadsheets/d/e/2PACX-1vSQKJm3tm5rn2Y6TkwxetJOgPNC1UyqYVeFXa5uYl1wj7g-8JJEgiSiEoOn8Na-1Q/pub?gid=264744847&single=true&output=csv",
 }
 
+# IMPORTANT: make these match the actual "Course" values in your sheets
 COURSE_LABELS = {
-    "ethics": "Ethica in NLP",
-    "hcml":   "H&I",
+    "ethics": "Ethics",
+    "hcml":   "HCML",
 }
 
 # --------------------------------------------------------------------------------------
@@ -53,6 +54,7 @@ border-radius:18px;padding:16px 18px;box-shadow:0 10px 30px rgba(0,0,0,.05)}
 a.lec { text-decoration: none; }
 .pred-meter {height:10px;border-radius:999px;background:#eee;overflow:hidden}
 .pred-meter > div {height:100%}
+.small-dim{opacity:.7;font-size:.9rem}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -67,8 +69,8 @@ def safe_div(a,b): return float(a)/float(b) if b else 0.0
 
 def course_color(name:str)->str:
     n=(name or "").lower()
-    if n.startswith("ethica"): return "#3b82f6"   # blue
-    if n.startswith("h&i") or "h&i" in n: return "#a855f7"  # purple
+    if n.startswith("ethic"): return "#3b82f6"   # blue
+    if "hcml" in n or "h&i" in n or "human" in n: return "#a855f7"  # purple
     return "#22c55e"
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -95,11 +97,37 @@ def pick(df: pd.DataFrame, *names):
         if n in df.columns: return n
     return None
 
+def canon_course(s: str) -> str:
+    s = (s or "").strip().lower()
+    if "ethic" in s: return "Ethics"
+    if "hcml" in s or "h&i" in s or "human" in s: return "HCML"
+    return s.title() if s else s
+
+# --------------------------------------------------------------------------------------
+# GERMAN GRADE CONVERSION (typical TU‑D style; adjust thresholds if needed)
+# Maps percentage → German 1.0(best) ... 4.0(pass) ... 5.0(fail)
+# --------------------------------------------------------------------------------------
+GERMAN_GRADE_MAP = [
+    (95, 1.0), (90, 1.3), (85, 1.7), (80, 2.0),
+    (75, 2.3), (70, 2.7), (65, 3.0), (60, 3.3),
+    (55, 3.7), (50, 4.0), (0, 5.0)
+]
+
+def percent_to_german_grade(pct: float) -> float:
+    try:
+        p = float(pct)
+    except Exception:
+        return 5.0
+    for threshold, grade in GERMAN_GRADE_MAP:
+        if p >= threshold:
+            return float(grade)
+    return 5.0
+
 # --------------------------------------------------------------------------------------
 # 3) LOAD SHEETS
 # --------------------------------------------------------------------------------------
 st.title("🎓 Master Study Dashboard (Multi‑Sheet)")
-st.caption("Live from your Google Sheets tabs: Lecture, Lectures_Ethics, Lectures_HCML, Quizzes, TimeLog, Files_Index")
+st.caption("Live from your Google Sheets: Lecture, Lectures_Ethics, Lectures_HCML, Quizzes, TimeLog, Files_Index")
 st.markdown('<div class="gradient-bar"></div>', unsafe_allow_html=True)
 
 colA,colB,_ = st.columns([1,1,3])
@@ -130,20 +158,20 @@ def normalize_lectures_generic(df: pd.DataFrame, default_course: str | None) -> 
     if df is None or df.empty:
         return pd.DataFrame(columns=["Course","LectureID","LectureName","Status","StudyMinutes","ReviewCount","LastReviewDate","Mastery"])
 
-    course_c = pick(df, "Course","course")
-    idc      = pick(df, "Lecture_ID","LectureID","ID","LecID","Lecture Id")
-    namec    = pick(df, "Title","LectureName","Name")
+    course_c = pick(df, "Course","course","Session")
+    idc      = pick(df, "Lecture_ID","LectureID","ID","LecID","Lecture Id","Session","Folder Name")
+    namec    = pick(df, "Title","LectureName","Name","File Name","Session Title")
     statc    = pick(df, "Status","Studied?","State")
-    minc     = pick(df, "StudyMinutes","Study_Min","Minutes","Total_Minutes")
+    minc     = pick(df, "StudyMinutes","Study_Min","Minutes","Total_Minutes","Duration")
     revc     = pick(df, "ReviewCount","Reviews","Review_Count")
     lastc    = pick(df, "Last_Review_Date","LastReviewDate","Last_Review","LastReview")
     mastc    = pick(df, "Mastery_0_5","Mastery","Knowledge_%")
 
     out = pd.DataFrame({
         "Course": df.get(course_c) if course_c else default_course,
-        "LectureID": df.get(idc, pd.Series(dtype=object)),
-        "LectureName": df.get(namec, pd.Series(dtype=object)),
-        "Status": df.get(statc, "Not Started").fillna("Not Started"),
+        "LectureID": df.get(idc, df.get(namec, pd.Series(dtype=object))),
+        "LectureName": df.get(namec, df.get(idc, pd.Series(dtype=object))),
+        "Status": df.get(statc, "Not started").fillna("Not started"),
         "StudyMinutes": df.get(minc, 0),
         "ReviewCount": df.get(revc, 0),
         "LastReviewDate": df.get(lastc, pd.NaT),
@@ -151,21 +179,17 @@ def normalize_lectures_generic(df: pd.DataFrame, default_course: str | None) -> 
     })
     out = coerce_numeric(out, ["StudyMinutes","ReviewCount","Mastery"])
     out = coerce_dates(out, ["LastReviewDate"])
-    # If mastery looks like 0..5 scale, normalize to 0..1
     if "Mastery" in out.columns:
-        max_m = out["Mastery"].dropna().max()
-        if pd.notna(max_m) and max_m > 1.5:
+        mx = out["Mastery"].dropna().max()
+        if pd.notna(mx) and mx > 1.5:
             out["Mastery"] = (out["Mastery"]/5.0).clip(0,1)
-    # Fill course if still missing
-    if default_course and ("Course" in out.columns):
-        out["Course"] = out["Course"].fillna(default_course)
+    out["Course"] = out["Course"].astype(str).map(canon_course) if "Course" in out.columns else default_course
     return out
 
 lect_master = normalize_lectures_generic(df_master, None)                         # should already include Course
 lect_ethics = normalize_lectures_generic(df_ethics, COURSE_LABELS["ethics"])
 lect_hcml   = normalize_lectures_generic(df_hcml,   COURSE_LABELS["hcml"])
 
-# Merge all lectures (master + per-course), deduplicate by (Course, LectureID) then by (Course, LectureName)
 lectures = pd.concat([lect_master, lect_ethics, lect_hcml], ignore_index=True)
 
 def dedupe_lectures(df: pd.DataFrame) -> pd.DataFrame:
@@ -180,13 +204,12 @@ def dedupe_lectures(df: pd.DataFrame) -> pd.DataFrame:
 
 lectures = dedupe_lectures(lectures)
 
-# Files index → map LectureID or LectureName to file path/URL
 def normalize_files(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["LectureID","LectureName","FilePath"])
-    idc   = pick(df, "Lecture_ID","LectureID","ID","LecID")
-    namec = pick(df, "Title","LectureName","Name")
-    pathc = pick(df, "Path","FilePath","DrivePath","URL","Link")
+    idc   = pick(df, "Lecture_ID","LectureID","ID","LecID","Folder Name")
+    namec = pick(df, "Title","LectureName","Name","File Name")
+    pathc = pick(df, "Path","FilePath","DrivePath","URL","Link","File URL")
     out = pd.DataFrame({
         "LectureID": df.get(idc, pd.Series(dtype=object)),
         "LectureName": df.get(namec, pd.Series(dtype=object)),
@@ -209,13 +232,12 @@ def attach_files(lectures: pd.DataFrame, files: pd.DataFrame) -> pd.DataFrame:
 
 lectures = attach_files(lectures, files)
 
-# Quizzes normalization → (Course, LectureID, Date, Type, Score[0..100])
 def normalize_quizzes(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["Course","LectureID","Date","Type","Score"])
     datec  = pick(df, "Date","Datetime")
-    course = pick(df, "Course")
-    lec    = pick(df, "Lecture_ID","LectureID","LecID","Lecture")
+    course = pick(df, "Course","Session")
+    lec    = pick(df, "Lecture_ID","LectureID","LecID","Lecture","Folder Name")
     typc   = pick(df, "Type","Mode")
     sc     = pick(df, "Score_%","Score","Result")
     out = pd.DataFrame({
@@ -231,17 +253,17 @@ def normalize_quizzes(df: pd.DataFrame) -> pd.DataFrame:
         max_s = out["Score"].dropna().max()
         if pd.notna(max_s) and max_s <= 1.5:
             out["Score"] = (out["Score"]*100).clip(0,100)
+    out["Course"] = out["Course"].astype(str).map(canon_course)
     return out
 
 scores = normalize_quizzes(df_quizzes)
 
-# TimeLog normalization → (Course, LectureID, Date, Minutes, Type)
 def normalize_timelog(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["Course","LectureID","Date","Minutes","Type"])
     datec = pick(df, "Date","Datetime")
-    course= pick(df, "Course")
-    lec   = pick(df, "Lecture_ID","LectureID","LecID","Lecture")
+    course= pick(df, "Course","Session")
+    lec   = pick(df, "Lecture_ID","LectureID","LecID","Lecture","Folder Name")
     minc  = pick(df, "Minutes","Min","Duration")
     typc  = pick(df, "Type","Activity")
     out = pd.DataFrame({
@@ -253,9 +275,15 @@ def normalize_timelog(df: pd.DataFrame) -> pd.DataFrame:
     })
     out = coerce_dates(out, ["Date"])
     out = coerce_numeric(out, ["Minutes"])
+    out["Course"] = out["Course"].astype(str).map(canon_course)
     return out
 
 sessions = normalize_timelog(df_time)
+
+# Make sure course names are canonical everywhere
+for df_ in [lectures, scores, sessions]:
+    if not df_.empty and "Course" in df_.columns:
+        df_["Course"] = df_["Course"].astype(str).map(canon_course)
 
 # --------------------------------------------------------------------------------------
 # 5) KPIs
@@ -265,9 +293,20 @@ def compute_course_kpis(course_name: str,
                         scores: pd.DataFrame) -> Dict[str, float]:
     l = lectures[lectures["Course"] == course_name].copy()
     s = scores[scores["Course"] == course_name].copy()
-    total_lectures = l["LectureID"].nunique() if "LectureID" in l.columns else 0
+
+    # total lectures: prefer LectureID, else LectureName, else row count
+    if not l.empty:
+        if "LectureID" in l.columns and l["LectureID"].notna().any():
+            total_lectures = l["LectureID"].dropna().astype(str).nunique()
+        elif "LectureName" in l.columns and l["LectureName"].notna().any():
+            total_lectures = l["LectureName"].dropna().astype(str).nunique()
+        else:
+            total_lectures = len(l)
+    else:
+        total_lectures = 0
+
     studied_mask = (l.get("Status","").isin(["In Progress","Studied","Completed"])) | (l.get("StudyMinutes",0) > 0) if not l.empty else pd.Series([], dtype=bool)
-    studied_lectures = int(l[studied_mask]["LectureID"].nunique()) if total_lectures else 0
+    studied_lectures = int(l[studied_mask]["LectureID"].astype(str).nunique()) if total_lectures else 0
     coverage = safe_div(studied_lectures, total_lectures)
 
     # knowledge progress
@@ -323,7 +362,7 @@ overall_pf  = float(np.mean(agg["perf"])) if agg["perf"] else 0.0
 overall_pb  = float(np.mean(agg["prob"])) if agg["prob"] else 0.0
 
 # --------------------------------------------------------------------------------------
-# 5.1) LIVE PREDICTED EXAM SCORE (new)
+# 5.1) LIVE PREDICTED EXAM SCORE (with German grade)
 # --------------------------------------------------------------------------------------
 def _bayes_mean(values, prior_mean=0.7, prior_strength=5):
     v = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
@@ -337,23 +376,22 @@ def compute_predicted_exam_score(course_name: str,
                                  lectures: pd.DataFrame,
                                  scores: pd.DataFrame,
                                  sessions: pd.DataFrame) -> Dict[str, float]:
-    """
-    Blends 4 signals (0..1):
-      - coverage: % studied lectures
-      - knowledge: mastery/review proxy
-      - quiz: average quiz score (0..1, bayesian-smoothed)
-      - flow: recent study minutes vs a light target (last 14d, target 600 min)
-    Returns predicted_score (0..100), confidence (0..1), components, weights.
-    """
-    # ----- slice per course
     L = lectures[lectures["Course"] == course_name].copy() if not lectures.empty else pd.DataFrame()
     S = scores[scores["Course"] == course_name].copy() if not scores.empty else pd.DataFrame()
     T = sessions[sessions["Course"] == course_name].copy() if not sessions.empty else pd.DataFrame()
 
     # coverage
-    total_lectures = L["LectureID"].nunique() if "LectureID" in L.columns else 0
+    if not L.empty:
+        if "LectureID" in L.columns and L["LectureID"].notna().any():
+            total_lectures = L["LectureID"].dropna().astype(str).nunique()
+        elif "LectureName" in L.columns and L["LectureName"].notna().any():
+            total_lectures = L["LectureName"].dropna().astype(str).nunique()
+        else:
+            total_lectures = len(L)
+    else:
+        total_lectures = 0
     studied_mask = (L.get("Status","").isin(["In Progress","Studied","Completed"])) | (L.get("StudyMinutes",0) > 0) if not L.empty else pd.Series([], dtype=bool)
-    studied_lectures = int(L[studied_mask]["LectureID"].nunique()) if total_lectures else 0
+    studied_lectures = int(L[studied_mask]["LectureID"].astype(str).nunique()) if total_lectures else 0
     coverage = safe_div(studied_lectures, total_lectures)
     cov_n = int(total_lectures)
 
@@ -367,7 +405,7 @@ def compute_predicted_exam_score(course_name: str,
         knowledge = float(rc.mean()) if len(rc) else 0.0
         kn_n = int(rc.notna().sum()) if len(rc) else 0
 
-    # quiz (0..1 with smoothing)
+    # quiz (0..1 smoothed)
     quiz_pct = np.nan
     quiz_n = 0
     if not S.empty and "Score" in S.columns:
@@ -389,7 +427,7 @@ def compute_predicted_exam_score(course_name: str,
             cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=14)
             recent = recent[recent["Date"] >= cutoff]
             mins14 = float(pd.to_numeric(recent["Minutes"], errors="coerce").fillna(0).sum())
-            target14 = 600.0  # tune if needed
+            target14 = 600.0
             if target14 > 0:
                 flow = float(np.clip(mins14/target14, 0, 1))
             flow_n = int(len(recent))
@@ -410,15 +448,19 @@ def compute_predicted_exam_score(course_name: str,
     blended = float(np.clip(np.sum(weights * comps), 0, 1))
     predicted_score = round(blended * 100.0, 1)
 
-    # confidence based on evidence + agreement
+    # confidence
     n_evidence = (cov_n/10) + (kn_n/10) + (quiz_n/25) + (flow_n/10)
     n_evidence = float(np.clip(n_evidence, 0, 1))
     dispersion = float(np.std(comps[mask])) if mask.any() else 0.35
     agreement = float(np.clip(1 - (dispersion / 0.35), 0, 1))
     confidence = round(0.5*n_evidence + 0.5*agreement, 2)
 
+    # German grade from predicted %
+    de_grade = percent_to_german_grade(predicted_score)
+
     return dict(
         predicted_score=predicted_score,
+        predicted_de_grade=de_grade,
         confidence=confidence,
         components={
             "coverage": round(coverage*100,1),
@@ -440,7 +482,7 @@ def render_predicted_exam_card(course_name: str, color: str):
     st.markdown(f"""
     <div class="kpi-card">
       <div class="kpi-title">📈 Predicted Exam Score — {course_name}</div>
-      <div class="kpi-value">{res['predicted_score']} %</div>
+      <div class="kpi-value">{res['predicted_score']} %  <span class="small-dim">≈ Grade (DE): {res['predicted_de_grade']:.1f}</span></div>
       <div class="kpi-sub">Confidence: {conf}%</div>
       <div class="pred-meter" style="margin-top:8px">
         <div style="width:{res['predicted_score']}%; background:{color}"></div>
@@ -461,19 +503,25 @@ k = st.columns(4)
 with k[0]: kpi_card("Lectures Remaining (All)", f"{max(0, agg['total']-agg['studied'])}", f"Total: {agg['total']}", "📚")
 with k[1]: kpi_card("Overall Study Coverage", f"{overall_cov*100:.1f}%", "Across both courses", "🧭")
 with k[2]: kpi_card("Avg Knowledge Progress", f"{overall_kn*100:.1f}%", "Mastery estimate", "🧠")
-with k[3]: kpi_card("Avg Quiz/Test Score", f"{overall_sc:.1f}", "0–100", "🎯")
+with k[3]:
+    avg_grade_de = percent_to_german_grade(overall_sc) if overall_sc>0 else 5.0
+    kpi_card("Avg Quiz/Test Score", f"{overall_sc:.1f}", f"≈ Avg Grade (DE): {avg_grade_de:.1f}", "🎯")
 
-# Quick overall predicted score (mean of per-course)
+# Quick overall predicted score (mean of per-course) + DE grade
 overall_preds = []
+overall_de_grades = []
 for c in course_list:
     r = compute_predicted_exam_score(c, lectures, scores, sessions)
     overall_preds.append(r["predicted_score"])
+    overall_de_grades.append(r["predicted_de_grade"])
 overall_predicted = round(float(np.mean(overall_preds)) if overall_preds else 55.0, 1)
+overall_predicted_de = round(float(np.mean(overall_de_grades)) if overall_de_grades else 4.0, 1)
 
 st.markdown("<br/>", unsafe_allow_html=True)
 k2 = st.columns(1)
 with k2[0]:
-    kpi_card("Overall Predicted Exam Score", f"{overall_predicted} %", "Average of course predictions", "📊")
+    kpi_card("Overall Predicted Exam Score", f"{overall_predicted} %",
+             f"Average of course predictions — ≈ Grade (DE): {overall_predicted_de:.1f}", "📊")
 
 # --------------------------------------------------------------------------------------
 # 7) TABS
@@ -496,7 +544,7 @@ with tabs[0]:
         fig2.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=0))
         st.plotly_chart(fig2, use_container_width=True)
 
-    # NEW: Per‑course predicted exam score quick cards
+    # Per‑course predicted exam score quick cards (with DE grade)
     ca, cb = st.columns(2)
     with ca:
         render_predicted_exam_card(COURSE_LABELS["ethics"], course_color(COURSE_LABELS["ethics"]))
@@ -512,6 +560,7 @@ with tabs[0]:
                     "Knowledge Progress (%)":round(x["knowledge_progress"]*100,1),
                     "Avg Score":round(x["avg_score"],1),
                     "Predicted Exam Score (%)": pred["predicted_score"],
+                    "Predicted Grade (DE)": round(pred["predicted_de_grade"],1),
                     "Confidence (%)": int(round(pred["confidence"]*100)),
                     "Performance":round(x["performance"],1),
                     "Lectures Remaining":max(0,x["total_lectures"]-x["studied_lectures"]),
@@ -550,10 +599,12 @@ with tabs[1]:
         with a: kpi_card("Lectures Remaining", f"{max(0,x['total_lectures']-x['studied_lectures'])}", f"Total: {x['total_lectures']}", "📚")
         with b: kpi_card("Study Coverage", f"{x['study_coverage']*100:.1f}%", "", "🧭")
         with d: kpi_card("Knowledge Progress", f"{x['knowledge_progress']*100:.1f}%", "", "🧠")
-        with e: kpi_card("Avg Score", f"{x['avg_score']:.1f}", "0–100", "🎯")
+        with e:
+            g_de = percent_to_german_grade(x["avg_score"]) if x["avg_score"]>0 else 5.0
+            kpi_card("Avg Score", f"{x['avg_score']:.1f}", f"≈ Grade (DE): {g_de:.1f}", "🎯")
         with f: kpi_card("P(Grade 1)", f"{x['grade1_prob']*100:.1f}%", f"Effort: ~{int(x['effort_minutes'])} min", "🏆")
 
-        # NEW: Predicted score card within each course
+        # Predicted score card within each course (with DE grade)
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         render_predicted_exam_card(c, course_color(c))
 
@@ -584,7 +635,6 @@ with tabs[2]:
         st.info("No lecture rows available. Check your Lecture/Lectures_Ethics/Lectures_HCML tabs.")
     else:
         show = lectures.copy()
-        # clickable file link
         if "FilePath" in show.columns:
             def linkit(row):
                 url = str(row["FilePath"])
@@ -603,6 +653,11 @@ with tabs[3]:
     else:
         cols = [c for c in ["Course","Date","Type","Score","LectureID"] if c in scores.columns]
         sdf = scores[cols].copy().sort_values("Date")
+        # Avg grade per course (DE)
+        if not sdf.empty:
+            tmp = sdf.groupby("Course", as_index=False)["Score"].mean()
+            tmp["Avg Grade (DE)"] = tmp["Score"].apply(percent_to_german_grade)
+            st.dataframe(tmp.rename(columns={"Score":"Avg Score"}), use_container_width=True, hide_index=True)
         st.dataframe(sdf, use_container_width=True, hide_index=True)
         fig = px.histogram(sdf, x="Score", color="Course", nbins=20, title="Score Distribution")
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
@@ -636,18 +691,18 @@ with tabs[6]:
     st.subheader("Flexible Expected Columns")
     st.markdown("""
 **Lecture / Lectures_Ethics / Lectures_HCML** (any of):  
-- `Course` (optional in per-course tabs; filled automatically)
-- `Lecture_ID | LectureID | ID | LecID`
-- `Title | LectureName | Name`
+- `Course | Session` (optional in per-course tabs; filled automatically)
+- `Lecture_ID | LectureID | ID | LecID | Folder Name`
+- `Title | LectureName | Name | File Name`
 - `Status | Studied?`
-- `StudyMinutes | Study_Min | Minutes | Total_Minutes`
+- `StudyMinutes | Study_Min | Minutes | Total_Minutes | Duration`
 - `ReviewCount | Reviews`
 - `Last_Review_Date | LastReviewDate | Last_Review`
 - `Mastery_0_5 | Mastery | Knowledge_%` (auto-normalized to 0–1)
 
-**Quizzes**: `Date`, `Course`, `Lecture_ID|LectureID`, `Type`, `Score_%|Score` (auto-normalized to 0–100)
+**Quizzes**: `Date`, `Course|Session`, `Lecture_ID|LectureID|LecID|Folder Name`, `Type`, `Score_%|Score` (auto-normalized to 0–100)
 
-**TimeLog**: `Date`, `Course`, `Lecture_ID|LectureID`, `Minutes`, (`Type` optional)
+**TimeLog**: `Date`, `Course|Session`, `Lecture_ID|LectureID|LecID|Folder Name`, `Minutes`, (`Type` optional)
 
-**Files_Index**: `Lecture_ID|LectureID`, `Title|LectureName`, `Path|FilePath|URL|Link`
+**Files_Index**: `Lecture_ID|LectureID|Folder Name`, `Title|LectureName|File Name`, `Path|FilePath|URL|Link|File URL`
 """)
