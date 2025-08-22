@@ -3,7 +3,7 @@
 # Reads 6 published CSV tabs from your Google Sheet:
 #   Lecture (master), Lectures_Ethics, Lectures_HCML, Quizzes, TimeLog, Files_Index
 # KPIs: remaining lectures, study coverage, knowledge progress, avg score, performance,
-# effort to reach grade 1, probability of grade 1.
+# effort to reach grade 1, probability of grade 1, and LIVE Predicted Exam Score.
 # Charts: score trend, distribution, weekly minutes, per‑course timelines. Includes a What‑If planner.
 
 from __future__ import annotations
@@ -51,6 +51,8 @@ border-radius:18px;padding:16px 18px;box-shadow:0 10px 30px rgba(0,0,0,.05)}
 .gradient-bar{height:8px;border-radius:999px;background:linear-gradient(90deg,#22c55e,#3b82f6,#a855f7)}
 .badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:.8rem;border:1px solid rgba(200,200,200,.45);background:rgba(255,255,255,.35)}
 a.lec { text-decoration: none; }
+.pred-meter {height:10px;border-radius:999px;background:#eee;overflow:hidden}
+.pred-meter > div {height:100%}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -122,9 +124,8 @@ df_time    = load_csv(SHEET_LINKS["TimeLog"])
 # --------------------------------------------------------------------------------------
 def normalize_lectures_generic(df: pd.DataFrame, default_course: str | None) -> pd.DataFrame:
     """
-    Accepts any of the lecture sheets and returns unified columns:
+    Returns unified columns:
     Course, LectureID, LectureName, Status, StudyMinutes, ReviewCount, LastReviewDate, Mastery
-    If default_course is provided, fills Course when missing.
     """
     if df is None or df.empty:
         return pd.DataFrame(columns=["Course","LectureID","LectureName","Status","StudyMinutes","ReviewCount","LastReviewDate","Mastery"])
@@ -169,13 +170,10 @@ lectures = pd.concat([lect_master, lect_ethics, lect_hcml], ignore_index=True)
 
 def dedupe_lectures(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
-    # Prefer rows that have more information (higher StudyMinutes or Mastery not null)
     x["_info_score"] = x["StudyMinutes"].fillna(0) + x["ReviewCount"].fillna(0) + x["Mastery"].fillna(0)
-    # First dedupe by Course+LectureID if ID present
     if "LectureID" in x.columns:
         x = x.sort_values(["Course","LectureID","_info_score"], ascending=[True,True,False])
         x = x.drop_duplicates(subset=["Course","LectureID"], keep="first")
-    # Then dedupe by Course+LectureName for any leftovers without IDs
     x = x.sort_values(["Course","LectureName","_info_score"], ascending=[True,True,False])
     x = x.drop_duplicates(subset=["Course","LectureName"], keep="first")
     return x.drop(columns=["_info_score"], errors="ignore")
@@ -198,18 +196,14 @@ def normalize_files(df: pd.DataFrame) -> pd.DataFrame:
 
 files = normalize_files(df_files)
 
-# Attach FilePath onto lectures (first by ID, then by Name)
 def attach_files(lectures: pd.DataFrame, files: pd.DataFrame) -> pd.DataFrame:
     L = lectures.copy()
     F = files.copy()
-    # by ID
     if "LectureID" in L.columns and "LectureID" in F.columns:
         L = L.merge(F[["LectureID","FilePath"]], on="LectureID", how="left", suffixes=("","_byID"))
-    # by Name (fill missing)
     if "LectureName" in L.columns and "LectureName" in F.columns:
         L = L.merge(F[["LectureName","FilePath"]].rename(columns={"FilePath":"FilePath_byName"}),
                     on="LectureName", how="left")
-    # prefer ID match
     L["FilePath"] = L["FilePath"].fillna(L.get("FilePath_byName"))
     return L.drop(columns=[c for c in ["FilePath_byName"] if c in L.columns])
 
@@ -233,7 +227,6 @@ def normalize_quizzes(df: pd.DataFrame) -> pd.DataFrame:
     })
     out = coerce_dates(out, ["Date"])
     out = coerce_numeric(out, ["Score"])
-    # If scores look like 0..1, scale to 0..100
     if "Score" in out.columns:
         max_s = out["Score"].dropna().max()
         if pd.notna(max_s) and max_s <= 1.5:
@@ -330,6 +323,138 @@ overall_pf  = float(np.mean(agg["perf"])) if agg["perf"] else 0.0
 overall_pb  = float(np.mean(agg["prob"])) if agg["prob"] else 0.0
 
 # --------------------------------------------------------------------------------------
+# 5.1) LIVE PREDICTED EXAM SCORE (new)
+# --------------------------------------------------------------------------------------
+def _bayes_mean(values, prior_mean=0.7, prior_strength=5):
+    v = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    if v.empty:
+        return float(prior_mean)
+    n = len(v)
+    m = float(v.clip(0,1).mean())
+    return (prior_strength*prior_mean + n*m) / (prior_strength + n)
+
+def compute_predicted_exam_score(course_name: str,
+                                 lectures: pd.DataFrame,
+                                 scores: pd.DataFrame,
+                                 sessions: pd.DataFrame) -> Dict[str, float]:
+    """
+    Blends 4 signals (0..1):
+      - coverage: % studied lectures
+      - knowledge: mastery/review proxy
+      - quiz: average quiz score (0..1, bayesian-smoothed)
+      - flow: recent study minutes vs a light target (last 14d, target 600 min)
+    Returns predicted_score (0..100), confidence (0..1), components, weights.
+    """
+    # ----- slice per course
+    L = lectures[lectures["Course"] == course_name].copy() if not lectures.empty else pd.DataFrame()
+    S = scores[scores["Course"] == course_name].copy() if not scores.empty else pd.DataFrame()
+    T = sessions[sessions["Course"] == course_name].copy() if not sessions.empty else pd.DataFrame()
+
+    # coverage
+    total_lectures = L["LectureID"].nunique() if "LectureID" in L.columns else 0
+    studied_mask = (L.get("Status","").isin(["In Progress","Studied","Completed"])) | (L.get("StudyMinutes",0) > 0) if not L.empty else pd.Series([], dtype=bool)
+    studied_lectures = int(L[studied_mask]["LectureID"].nunique()) if total_lectures else 0
+    coverage = safe_div(studied_lectures, total_lectures)
+    cov_n = int(total_lectures)
+
+    # knowledge
+    if "Mastery" in L.columns and not L["Mastery"].isna().all():
+        knowledge = float(L["Mastery"].fillna(0).clip(0,1).mean())
+        kn_n = int(L["Mastery"].notna().sum())
+    else:
+        target_reviews = 3
+        rc = (L.get("ReviewCount", pd.Series(dtype=float)).fillna(0)/target_reviews).clip(0,1)
+        knowledge = float(rc.mean()) if len(rc) else 0.0
+        kn_n = int(rc.notna().sum()) if len(rc) else 0
+
+    # quiz (0..1 with smoothing)
+    quiz_pct = np.nan
+    quiz_n = 0
+    if not S.empty and "Score" in S.columns:
+        vals = pd.to_numeric(S["Score"], errors="coerce").dropna()
+        if not vals.empty:
+            if (vals > 1.5).any():
+                vals = vals/100.0
+            quiz_pct = float(vals.clip(0,1).mean())
+            quiz_n = int(len(vals))
+    quiz_smoothed = _bayes_mean([] if np.isnan(quiz_pct) else [quiz_pct], prior_mean=0.7, prior_strength=5)
+
+    # flow: minutes last 14 days vs 600‑min target
+    flow = 0.5
+    flow_n = 0
+    if not T.empty and "Date" in T.columns and "Minutes" in T.columns:
+        recent = T.dropna(subset=["Date","Minutes"]).copy()
+        if not recent.empty:
+            recent["Date"] = pd.to_datetime(recent["Date"], errors="coerce")
+            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=14)
+            recent = recent[recent["Date"] >= cutoff]
+            mins14 = float(pd.to_numeric(recent["Minutes"], errors="coerce").fillna(0).sum())
+            target14 = 600.0  # tune if needed
+            if target14 > 0:
+                flow = float(np.clip(mins14/target14, 0, 1))
+            flow_n = int(len(recent))
+
+    # dynamic weights by reliability
+    w_cov = 0.35 * (1.0 if cov_n >= 8 else 0.8 if cov_n >= 3 else 0.6)
+    w_kn  = 0.25 * (1.0 if kn_n  >= 8 else 0.8 if kn_n  >= 3 else 0.6)
+    w_qz  = 0.35 * (1.0 if quiz_n>=20 else 0.8 if quiz_n>=10 else 0.6)
+    w_fl  = 0.05 * (1.0 if flow_n>=6 else 0.7)
+
+    comps = np.array([coverage, knowledge, quiz_smoothed, flow], dtype=float)
+    weights = np.array([w_cov, w_kn, w_qz, w_fl], dtype=float)
+    mask = np.isfinite(comps)
+    weights[~mask] = 0.0
+    if weights.sum() == 0:
+        weights = np.ones_like(weights) * mask
+    weights = weights / weights.sum()
+    blended = float(np.clip(np.sum(weights * comps), 0, 1))
+    predicted_score = round(blended * 100.0, 1)
+
+    # confidence based on evidence + agreement
+    n_evidence = (cov_n/10) + (kn_n/10) + (quiz_n/25) + (flow_n/10)
+    n_evidence = float(np.clip(n_evidence, 0, 1))
+    dispersion = float(np.std(comps[mask])) if mask.any() else 0.35
+    agreement = float(np.clip(1 - (dispersion / 0.35), 0, 1))
+    confidence = round(0.5*n_evidence + 0.5*agreement, 2)
+
+    return dict(
+        predicted_score=predicted_score,
+        confidence=confidence,
+        components={
+            "coverage": round(coverage*100,1),
+            "knowledge": round(knowledge*100,1),
+            "quiz": round(quiz_smoothed*100,1),
+            "flow": round(flow*100,1)
+        },
+        weights={
+            "coverage": round(float(weights[0]),2),
+            "knowledge": round(float(weights[1]),2),
+            "quiz": round(float(weights[2]),2),
+            "flow": round(float(weights[3]),2),
+        }
+    )
+
+def render_predicted_exam_card(course_name: str, color: str):
+    res = compute_predicted_exam_score(course_name, lectures, scores, sessions)
+    conf = int(round(res["confidence"]*100))
+    st.markdown(f"""
+    <div class="kpi-card">
+      <div class="kpi-title">📈 Predicted Exam Score — {course_name}</div>
+      <div class="kpi-value">{res['predicted_score']} %</div>
+      <div class="kpi-sub">Confidence: {conf}%</div>
+      <div class="pred-meter" style="margin-top:8px">
+        <div style="width:{res['predicted_score']}%; background:{color}"></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    with st.expander("Details"):
+        st.write(pd.DataFrame({
+            "component":["Coverage","Knowledge","Quiz","Study flow"],
+            "value %":[res["components"]["coverage"],res["components"]["knowledge"],res["components"]["quiz"],res["components"]["flow"]],
+            "weight":[res["weights"]["coverage"],res["weights"]["knowledge"],res["weights"]["quiz"],res["weights"]["flow"]],
+        }))
+
+# --------------------------------------------------------------------------------------
 # 6) TOP KPIs
 # --------------------------------------------------------------------------------------
 k = st.columns(4)
@@ -337,6 +462,18 @@ with k[0]: kpi_card("Lectures Remaining (All)", f"{max(0, agg['total']-agg['stud
 with k[1]: kpi_card("Overall Study Coverage", f"{overall_cov*100:.1f}%", "Across both courses", "🧭")
 with k[2]: kpi_card("Avg Knowledge Progress", f"{overall_kn*100:.1f}%", "Mastery estimate", "🧠")
 with k[3]: kpi_card("Avg Quiz/Test Score", f"{overall_sc:.1f}", "0–100", "🎯")
+
+# Quick overall predicted score (mean of per-course)
+overall_preds = []
+for c in course_list:
+    r = compute_predicted_exam_score(c, lectures, scores, sessions)
+    overall_preds.append(r["predicted_score"])
+overall_predicted = round(float(np.mean(overall_preds)) if overall_preds else 55.0, 1)
+
+st.markdown("<br/>", unsafe_allow_html=True)
+k2 = st.columns(1)
+with k2[0]:
+    kpi_card("Overall Predicted Exam Score", f"{overall_predicted} %", "Average of course predictions", "📊")
 
 # --------------------------------------------------------------------------------------
 # 7) TABS
@@ -356,17 +493,31 @@ with tabs[0]:
         fig2 = go.Figure(go.Indicator(mode="gauge+number", value=overall_pb*100.0,
                   number={'suffix': "%"}, title={'text':"Live P(Grade = 1)"},
                   gauge={'axis':{'range':[0,100]}, 'bar':{'color':"#6366f1"}}))
-        fig2.update_layout(height=220, margin=dict(l=10,r=10,t=40,b=0))
+        fig2.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=0))
         st.plotly_chart(fig2, use_container_width=True)
+
+    # NEW: Per‑course predicted exam score quick cards
+    ca, cb = st.columns(2)
+    with ca:
+        render_predicted_exam_card(COURSE_LABELS["ethics"], course_color(COURSE_LABELS["ethics"]))
+    with cb:
+        render_predicted_exam_card(COURSE_LABELS["hcml"], course_color(COURSE_LABELS["hcml"]))
 
     rows=[]
     for c in course_list:
         x=per_course[c]
-        rows.append({"Course":c,"Study Coverage (%)":round(x["study_coverage"]*100,1),
+        pred = compute_predicted_exam_score(c, lectures, scores, sessions)
+        rows.append({"Course":c,
+                    "Study Coverage (%)":round(x["study_coverage"]*100,1),
                     "Knowledge Progress (%)":round(x["knowledge_progress"]*100,1),
-                    "Avg Score":round(x["avg_score"],1),"Performance":round(x["performance"],1),
+                    "Avg Score":round(x["avg_score"],1),
+                    "Predicted Exam Score (%)": pred["predicted_score"],
+                    "Confidence (%)": int(round(pred["confidence"]*100)),
+                    "Performance":round(x["performance"],1),
                     "Lectures Remaining":max(0,x["total_lectures"]-x["studied_lectures"]),
-                    "P(Grade 1) %":round(x["grade1_prob"]*100,1),"Effort (min)":int(x["effort_minutes"])})
+                    "P(Grade 1) %":round(x["grade1_prob"]*100,1),
+                    "Effort (min)":int(x["effort_minutes"])})
+
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     # Score trend (if any)
@@ -401,6 +552,10 @@ with tabs[1]:
         with d: kpi_card("Knowledge Progress", f"{x['knowledge_progress']*100:.1f}%", "", "🧠")
         with e: kpi_card("Avg Score", f"{x['avg_score']:.1f}", "0–100", "🎯")
         with f: kpi_card("P(Grade 1)", f"{x['grade1_prob']*100:.1f}%", f"Effort: ~{int(x['effort_minutes'])} min", "🏆")
+
+        # NEW: Predicted score card within each course
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        render_predicted_exam_card(c, course_color(c))
 
         w1,w2,w3 = st.columns(3)
         cov_boost = w1.slider(f"{c} — Boost coverage (%)", 0, 40, 10, 5)
